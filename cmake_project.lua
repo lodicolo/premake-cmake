@@ -11,7 +11,6 @@
 -- Created:     2013/05/06
 -- Copyright:   (c) 2008-2020 Jason Perkins and the Premake project
 --
-
 local p = premake
 local tree = p.tree
 local project = p.project
@@ -21,6 +20,27 @@ local cmake = p.modules.cmake
 cmake.project = {}
 local m = cmake.project
 
+local printf = function(s, ...)
+	return print(s:format(...))
+end
+
+--- Check if a file or directory exists in this path
+local function exists(file)
+	local ok, err, code = os.rename(file, file)
+	if not ok then
+		if code == 13 then
+			-- Permission denied, but it exists
+			return true
+		end
+	end
+	return ok, err
+end
+
+--- Check if a directory exists in this path
+local function isdir(path)
+	-- "/" works on both Unix and Windows
+	return exists(path .. "/")
+end
 
 function m.getcompiler(cfg)
 	local default = iif(cfg.system == p.WINDOWS, "msc", "clang")
@@ -45,13 +65,13 @@ end
 --
 function m.generate(prj)
 	p.utf8()
-    
-    -- if kind is only defined for configs, promote to project
-    if prj.kind == nil then
-        for cfg in project.eachconfig(prj) do
-            prj.kind = cfg.kind
-        end
-    end
+
+	-- if kind is only defined for configs, promote to project
+	if prj.kind == nil then
+		for cfg in project.eachconfig(prj) do
+			prj.kind = cfg.kind
+		end
+	end
 
 	if prj.kind == 'Utility' then
 		return
@@ -81,16 +101,25 @@ function m.generate(prj)
 			for _, dependency in ipairs(dependencies) do
 				_p(2, '"%s"', dependency.name)
 			end
-			_p(1,')')
+			_p(1, ')')
 		end
 
 		-- output dir
-		_p(1,'set_target_properties("%s" PROPERTIES', prj.name)
+		local ok = isdir(cfg.buildtarget.directory)
+		if ok then
+		else
+			local ok, err = os.mkdir(cfg.buildtarget.directory)
+			if ok == nil then
+				printf("Unable to create directoy: %s", err)
+			end
+		end
+
+		_p(1, 'set_target_properties("%s" PROPERTIES', prj.name)
 		_p(2, 'OUTPUT_NAME "%s"', cfg.buildtarget.basename)
 		_p(2, 'ARCHIVE_OUTPUT_DIRECTORY "%s"', cfg.buildtarget.directory)
 		_p(2, 'LIBRARY_OUTPUT_DIRECTORY "%s"', cfg.buildtarget.directory)
 		_p(2, 'RUNTIME_OUTPUT_DIRECTORY "%s"', cfg.buildtarget.directory)
-		_p(1,')')
+		_p(1, ')')
 		_p('endif()')
 
 		-- include dirs
@@ -119,21 +148,21 @@ function m.generate(prj)
 		-- Do not use toolset here as cmake needs to resolve dependency chains
 		local uselinkgroups = isclangorgcc and cfg.linkgroups == p.ON
 		if uselinkgroups then
-		  _p(1, '-Wl,--start-group')
+			_p(1, '-Wl,--start-group')
 		end
 		for a, link in ipairs(config.getlinks(cfg, "dependencies", "object")) do
 			_p(1, '$<$<CONFIG:%s>:%s>', cmake.cfgname(cfg), link.linktarget.basename)
 		end
 		if uselinkgroups then
-		  -- System libraries don't depend on the project
-		  _p(1, '-Wl,--end-group')
-		  _p(1, '-Wl,--start-group')
+			-- System libraries don't depend on the project
+			_p(1, '-Wl,--end-group')
+			_p(1, '-Wl,--start-group')
 		end
 		for _, link in ipairs(config.getlinks(cfg, "system", "fullpath")) do
 			_p(1, '$<$<CONFIG:%s>:%s>', cmake.cfgname(cfg), link)
 		end
 		if uselinkgroups then
-		  _p(1, '-Wl,--end-group')
+			_p(1, '-Wl,--end-group')
 		end
 		_p(')')
 
@@ -142,7 +171,7 @@ function m.generate(prj)
 		for _, option in ipairs(cfg.buildoptions) do
 			all_build_options = all_build_options .. option .. " "
 		end
-		
+
 		if all_build_options ~= "" then
 			_p('if(CMAKE_BUILD_TYPE STREQUAL %s)', cmake.cfgname(cfg))
 			_p(1, 'set_target_properties("%s" PROPERTIES COMPILE_FLAGS "%s")', prj.name, all_build_options)
@@ -160,8 +189,7 @@ function m.generate(prj)
 			_p(1, 'set_target_properties("%s" PROPERTIES LINK_FLAGS "%s")', prj.name, all_link_options)
 			_p('endif()')
 		end
-		
-		
+
 		_p('target_compile_options("%s" PRIVATE', prj.name)
 
 		for _, flag in ipairs(toolset.getcflags(cfg)) do
@@ -232,6 +260,90 @@ function m.generate(prj)
 			_p('if(CMAKE_BUILD_TYPE STREQUAL %s)', cmake.cfgname(cfg))
 			_p('target_precompile_headers("%s" PUBLIC %s)', prj.name, pch)
 			_p('endif()')
+		end
+
+		local getBuildCommands = function(t, cmd)
+			local out = ""
+			for _, v in ipairs(cfg[t]) do
+				local isdir = false
+				local isfile = false
+
+				local s, e = v:find("{COPYDIR}")
+				if s ~= nil then
+					isdir = true
+				else
+					s, e = v:find("{COPYFILE}")
+					if s ~= nil then
+						isfile = true
+					end
+				end
+
+				if not isdir and not isfile then
+					s, e = v:find("{COPY}")
+					if s == nil then
+						printf("WARNING: Command '%s...' is not supported...", v:sub(1, 64))
+					else
+						-- Check if the file we have is a dir or a file.
+						if isdir(cfg.project.location .. "/" .. v) then
+							isdir = true
+						else
+							isfile = true
+						end
+					end
+				end
+
+				if isdir or isfile then
+					v = v:sub(e + 2)
+					v = v:gsub("\\", "/")
+					out = out .. string.format("    add_custom_command(TARGET %s %s\n", prj.name, cmd)
+
+					local command = "copy"
+					if isdir then
+						command = "copy_directory"
+					end
+
+					local ve = v:explode(" +")
+					local source = ve[1]
+					local dest = ve[2]
+
+					out = out ..
+						string.format(
+							"        COMMAND \"${CMAKE_COMMAND}\" -E %s \"%s\" \"%s\"\n",
+							command,
+							path.normalize(path.translate(cfg.project.location .. "/" .. source)),
+							path.normalize(path.translate(cfg.project.location .. "/" .. dest))
+						) .. "    )"
+				else
+					printf("WARNING: Unable to determine file system to copy in '%s...'", v:sub(1, 64))
+				end
+			end
+
+			return out
+		end
+
+		-- Pre build commands.
+		local preBuildCommands = getBuildCommands("prebuildcommands", "PRE_BUILD")
+
+		-- Pre link commands.
+		local preLinkCommands = getBuildCommands("prelinkcommands", "PRE_LINK")
+
+		-- Post build commands.
+		local postBuildCommands = getBuildCommands("postbuildcommands", "POST_BUILD")
+
+		if preBuildCommands ~= "" then
+			_p("if(CMAKE_BUILD_TYPE STREQUAL %s)", cmake.cfgname(cfg))
+			_p("%s", preBuildCommands)
+			_p("endif()")
+		end
+		if preLinkCommands ~= "" then
+			_p("if(CMAKE_BUILD_TYPE STREQUAL %s)", cmake.cfgname(cfg))
+			_p("%s", preLinkCommands)
+			_p("endif()")
+		end
+		if postBuildCommands ~= "" then
+			_p("if(CMAKE_BUILD_TYPE STREQUAL %s)", cmake.cfgname(cfg))
+			_p("%s", postBuildCommands)
+			_p("endif()")
 		end
 	end
 end
